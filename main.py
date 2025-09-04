@@ -1,74 +1,91 @@
 import torch
-from torch.utils.data import DataLoader
-from dataloader import get_tokenizers, build_vocabs, get_iwslt_dataset, collate_batch
-from bleu import compute_bleu
-from SharedSupermaskTransformer import SharedSupermaskTransformer
-
+import torch.nn as nn
+import torch.optim as optim
 import argparse
-import os
+from dataloader import get_dataloaders
+from SharedSupermaskTransformer import SharedSupermaskTransformer
+from bleu import compute_bleu
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--prune_ratio', type=float, default=0.5, help='Fraction of weights to keep')
-    parser.add_argument('--num_layers', type=int, default=6, help='Number of encoder/decoder layers')
-    parser.add_argument('--dim_model', type=int, default=512, help='Embedding/hidden size')
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    return parser.parse_args()
 
-def main():
-    args = parse_args()
-    device = args.device
+def train(model, dataloader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    for batch in dataloader:
+        inputs, targets = batch['src'].to(device), batch['tgt'].to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs, targets)
+        loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
 
-    # 1. Tokenizers and Vocabs
-    token_transform, vocab_transform = get_tokenizers()
-    vocab_transform = build_vocabs(token_transform)
 
-    # 2. Dataset + Dataloader
-    train_data, valid_data = get_iwslt_dataset()
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: collate_batch(b, token_transform, vocab_transform))
-    valid_loader = DataLoader(valid_data, batch_size=args.batch_size, shuffle=False, collate_fn=lambda b: collate_batch(b, token_transform, vocab_transform))
+def evaluate(model, dataloader, device):
+    model.eval()
+    all_preds = []
+    all_targets = []
+    with torch.no_grad():
+        for batch in dataloader:
+            inputs, targets = batch['src'].to(device), batch['tgt'].to(device)
+            outputs = model.generate(inputs)
+            all_preds.extend(outputs)
+            all_targets.extend(targets.cpu().tolist())
 
-    # 3. Model
+    bleu = compute_bleu(all_preds, all_targets)
+    return bleu
+
+
+def main(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load data
+    train_loader, valid_loader, src_vocab_size, tgt_vocab_size = get_dataloaders(
+        dataset_name=args.dataset,
+        batch_size=args.batch_size,
+        max_len=args.max_len
+    )
+
+    # Model
     model = SharedSupermaskTransformer(
-        vocab_size=len(vocab_transform['de']),
-        tgt_vocab_size=len(vocab_transform['en']),
-        dim_model=args.dim_model,
+        src_vocab_size=src_vocab_size,
+        tgt_vocab_size=tgt_vocab_size,
+        embed_dim=args.embed_dim,
+        num_heads=args.num_heads,
         num_layers=args.num_layers,
-        prune_ratio=args.prune_ratio
+        ffn_dim=args.ffn_dim,
+        dropout=args.dropout,
+        prune_ratio=args.prune_ratio,
+        init_type=args.init_type
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # Loss and optimizer
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
 
-    # 4. Training loop
-    print(f"Starting training for {args.epochs} epochs on {device}...")
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        total_loss = 0
-        for src, tgt in train_loader:
-            src, tgt = src.to(device), tgt.to(device)
-            tgt_input = tgt[:, :-1]
-            tgt_output = tgt[:, 1:]
+    # Training loop
+    for epoch in range(args.epochs):
+        train_loss = train(model, train_loader, optimizer, criterion, device)
+        bleu_score = evaluate(model, valid_loader, device)
+        print(f"[Epoch {epoch+1}] Train Loss: {train_loss:.4f} | BLEU: {bleu_score:.2f}")
 
-            logits = model(src, tgt_input)
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                tgt_output.contiguous().view(-1),
-                ignore_index=0
-            )
+    print("Training complete.")
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-        print(f"Epoch {epoch}: Train Loss = {total_loss / len(train_loader):.4f}")
-
-    # 5. BLEU evaluation
-    print("Evaluating BLEU score...")
-    bleu = compute_bleu(model, valid_loader, vocab_transform['en'])
-    print(f"\nFinal BLEU score: {bleu:.2f}")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='iwslt2017', help='Dataset name')
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--embed_dim', type=int, default=512)
+    parser.add_argument('--ffn_dim', type=int, default=2048)
+    parser.add_argument('--num_heads', type=int, default=8)
+    parser.add_argument('--num_layers', type=int, default=1, help='Use 1-layer shared transformer')
+    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--prune_ratio', type=float, default=0.5)
+    parser.add_argument('--init_type', type=str, default='kaiming_uniform')
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--max_len', type=int, default=128)
+    args = parser.parse_args()
+
+    main(args)
