@@ -11,13 +11,22 @@ def train(model, dataloader, optimizer, criterion, device):
     model.train()
     total_loss = 0
     for batch in dataloader:
-        inputs, targets = batch['src'].to(device), batch['tgt'].to(device)
+        inputs = batch['src'].to(device)
+        targets = batch['tgt'].to(device)
+
         optimizer.zero_grad()
-        outputs = model(inputs, targets)
-        loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
+        logits = model(inputs, targets)  # [B, T, V]
+
+        # Shift targets for loss
+        loss = criterion(
+            logits.view(-1, logits.size(-1)),  # [B*T, V]
+            targets.view(-1)                   # [B*T]
+        )
+
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
+
     return total_loss / len(dataloader)
 
 
@@ -25,11 +34,14 @@ def evaluate(model, dataloader, device):
     model.eval()
     all_preds = []
     all_targets = []
+
     with torch.no_grad():
         for batch in dataloader:
-            inputs, targets = batch['src'].to(device), batch['tgt'].to(device)
-            outputs = model.generate(inputs)
-            all_preds.extend(outputs)
+            inputs = batch['src'].to(device)
+            targets = batch['tgt'].to(device)
+
+            pred_ids = model.generate(inputs)  # List[List[int]]
+            all_preds.extend(pred_ids)
             all_targets.extend(targets.cpu().tolist())
 
     bleu = compute_bleu(all_preds, all_targets)
@@ -69,7 +81,7 @@ def main(args):
         bleu_score = evaluate(model, valid_loader, device)
         print(f"[Epoch {epoch+1}] Train Loss: {train_loss:.4f} | BLEU: {bleu_score:.2f}")
 
-    print("Training complete.")
+    print("✅ Training complete.")
 
 
 if __name__ == "__main__":
