@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from SupermaskTransformerBlock import SupermaskTransformerBlock
 
 
 class SharedSupermaskTransformer(nn.Module):
@@ -7,78 +8,74 @@ class SharedSupermaskTransformer(nn.Module):
         self,
         vocab_size,
         embed_dim,
+        num_layers,
         num_heads,
         ff_dim,
-        num_layers,
-        max_seq_len=512,
-        prune_rate=0.5,
-        dropout=0.1
+        dropout=0.1,
+        max_len=512,
+        prune_ratio=0.5,
+        mask_init="standard",
+        prune_method="topk"
     ):
-        super().__init__()
+        super(SharedSupermaskTransformer, self).__init__()
 
-        self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len, embed_dim))
+        self.embed_tokens = nn.Embedding(vocab_size, embed_dim)
+        self.pos_embedding = nn.Embedding(max_len, embed_dim)
 
-        # Shared layer: only one!
+        self.dropout = nn.Dropout(dropout)
+        self.embed_scale = embed_dim ** 0.5
+        self.max_len = max_len
+
+        self.num_layers = num_layers
+
+        # === Shared randomly initialized Transformer block === #
         self.shared_block = SupermaskTransformerBlock(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            ff_dim=ff_dim,
-            prune_rate=prune_rate,
-            dropout=dropout
+            embed_dim,
+            num_heads,
+            ff_dim,
+            dropout,
+            prune_ratio=prune_ratio,
+            mask_init=mask_init,
+            prune_method=prune_method
         )
 
-        # Create L separate sets of scores (Supermasks) for reuse
-        self.masks = nn.ModuleList([
-            copy.deepcopy(self.shared_block)
+        # === Learnable supermask scores per layer === #
+        self.mask_scores_per_layer = nn.ModuleList([
+            self.shared_block.init_mask_scores()
             for _ in range(num_layers)
         ])
 
-        self.norm = nn.LayerNorm(embed_dim)
-        self.output_head = nn.Linear(embed_dim, vocab_size)
+        self.output_proj = nn.Linear(embed_dim, vocab_size)
 
-    def forward(self, x):
-        B, T = x.size()
-        x = self.embed(x) + self.pos_embed[:, :T]
-
-        # Forward through shared weights, different masks
-        for i, block in enumerate(self.masks):
-            # Point all layers to shared weights
-            self._share_weights(block, self.shared_block)
-            x = block(x)
-
-        x = self.norm(x)
-        return self.output_head(x)
-
-    def _share_weights(self, block, shared_block):
+    def forward(self, input_ids, attention_mask=None):
         """
-        Make all weights in `block` point to those in `shared_block`.
-        Each block has its own scores (mask), but shared W.
+        input_ids: (batch_size, seq_len)
+        attention_mask: (batch_size, seq_len)
         """
-        for (name, module), (sname, smodule) in zip(block.named_modules(), shared_block.named_modules()):
-            if isinstance(module, SupermaskLinear) and isinstance(smodule, SupermaskLinear):
-                module.weight = smodule.weight  # Shared W
-                module.training_or_inference = smodule.training_or_inference
-                module.current_mask = None  # force recompute
+        bsz, seq_len = input_ids.size()
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand(bsz, seq_len)
 
+        x = self.embed_scale * self.embed_tokens(input_ids) + self.pos_embedding(position_ids)
+        x = self.dropout(x)
 
+        for l in range(self.num_layers):
+            x = self.shared_block(
+                x,
+                attention_mask=attention_mask,
+                mask_scores=self.mask_scores_per_layer[l]
+            )
 
+        x = self.output_proj(x)
+        return x
 
+    def change_mode(self, mode="train"):
+        """
+        Switch between 'train' and 'eval' mode for deterministic masking
+        """
+        assert mode in ["train", "eval"], f"Invalid mode: {mode}"
+        self.shared_block.change_mode(mode)
+        self.train(mode == "train")
 
-
-
-'''
-model = SharedSupermaskTransformer(
-    vocab_size=10000,
-    embed_dim=512,
-    num_heads=8,
-    ff_dim=2048,
-    num_layers=6,          # Simulates a 6-layer Transformer
-    prune_rate=0.5,
-    dropout=0.1
-)
-
-dummy_input = torch.randint(0, 10000, (32, 64))  # (batch_size, seq_len)
-logits = model(dummy_input)  # Output: (32, 64, 10000)
-
-'''
+    def get_all_masks(self):
+        return [self.shared_block.get_mask(scores) for scores in self.mask_scores_per_layer]
