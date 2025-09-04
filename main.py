@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import argparse
-from dataloader import get_dataloaders
+
+from dataloader import get_dataloaders, SRC_LANGUAGE, TGT_LANGUAGE
 from SharedSupermaskTransformer import SharedSupermaskTransformer
 from bleu import compute_bleu
 
@@ -17,7 +18,6 @@ def train(model, dataloader, optimizer, criterion, device):
         optimizer.zero_grad()
         logits = model(inputs, targets)  # [B, T, V]
 
-        # Shift targets for loss
         loss = criterion(
             logits.view(-1, logits.size(-1)),  # [B*T, V]
             targets.view(-1)                   # [B*T]
@@ -30,38 +30,31 @@ def train(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader)
 
 
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, tgt_vocab, pad_idx, bos_idx, eos_idx, device):
     model.eval()
-    all_preds = []
-    all_targets = []
-
     with torch.no_grad():
-        for batch in dataloader:
-            inputs = batch['src'].to(device)
-            targets = batch['tgt'].to(device)
-
-            pred_ids = model.generate(inputs)  # List[List[int]]
-            all_preds.extend(pred_ids)
-            all_targets.extend(targets.cpu().tolist())
-
-    bleu = compute_bleu(all_preds, all_targets)
+        bleu = compute_bleu(model, dataloader, tgt_vocab, pad_idx, bos_idx, eos_idx)
     return bleu
 
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load data
-    train_loader, valid_loader, src_vocab_size, tgt_vocab_size = get_dataloaders(
+    # Load data + vocab
+    train_loader, valid_loader, src_vocab, tgt_vocab = get_dataloaders(
         dataset_name=args.dataset,
         batch_size=args.batch_size,
         max_len=args.max_len
     )
 
+    pad_idx = src_vocab["<pad>"]
+    bos_idx = src_vocab["<bos>"]
+    eos_idx = src_vocab["<eos>"]
+
     # Model
     model = SharedSupermaskTransformer(
-        src_vocab_size=src_vocab_size,
-        tgt_vocab_size=tgt_vocab_size,
+        src_vocab_size=len(src_vocab),
+        tgt_vocab_size=len(tgt_vocab),
         embed_dim=args.embed_dim,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
@@ -72,13 +65,13 @@ def main(args):
     ).to(device)
 
     # Loss and optimizer
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
     optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
 
     # Training loop
     for epoch in range(args.epochs):
         train_loss = train(model, train_loader, optimizer, criterion, device)
-        bleu_score = evaluate(model, valid_loader, device)
+        bleu_score = evaluate(model, valid_loader, tgt_vocab, pad_idx, bos_idx, eos_idx, device)
         print(f"[Epoch {epoch+1}] Train Loss: {train_loss:.4f} | BLEU: {bleu_score:.2f}")
 
     print("✅ Training complete.")
@@ -91,7 +84,7 @@ if __name__ == "__main__":
     parser.add_argument('--embed_dim', type=int, default=512)
     parser.add_argument('--ffn_dim', type=int, default=2048)
     parser.add_argument('--num_heads', type=int, default=8)
-    parser.add_argument('--num_layers', type=int, default=1, help='Use 1-layer shared transformer')
+    parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--prune_ratio', type=float, default=0.5)
     parser.add_argument('--init_type', type=str, default='kaiming_uniform')
