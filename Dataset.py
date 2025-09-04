@@ -82,7 +82,7 @@ def collate_batch_fn(vocab_transform, text_transform):
     return collate_batch
 
 
-def get_dataloaders(dataset_name="iwslt2016", batch_size=64, max_len=128):
+def get_dataloaders(dataset_name='iwslt2017', batch_size=64, max_len=128):
     assert dataset_name.lower() == "iwslt2016", "Only IWSLT2016 is supported right now."
 
     vocab_transform = build_vocabs()
@@ -109,4 +109,4 @@ def get_dataloaders(dataset_name="iwslt2016", batch_size=64, max_len=128):
     src_vocab_size = len(vocab_transform[SRC_LANGUAGE])
     tgt_vocab_size = len(vocab_transform[TGT_LANGUAGE])
 
-    return train_loader, valid_loader, src_vocab_size, tgt_vocab_size
+    return train_loader, valid_loader, vocab_transform[SRC_LANGUAGE], vocab_transform[TGT_LANGUAGE]
